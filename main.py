@@ -15,8 +15,8 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    DATA_PATH = r"D:\code\kuliah\robot-ai\training\test"               # Folder path
-    NUM_CLASSES = 2              # Banyak Folder di Path
+    DATA_PATH = r"D:\code\kuliah\robot-ai\training\train"               # Folder path
+    NUM_CLASSES = 2              # Banyak Folder/class di Path
     BATCH_SIZE = 32
     NUM_EPOCHS = 20
     LEARNING_RATE = 0.001
@@ -41,7 +41,7 @@ if __name__ == '__main__':
 
     # Load dataset
     train_dataset = datasets.ImageFolder(
-        root=os.path.join(DATA_PATH, "img"), 
+        root=os.path.join(DATA_PATH, "train _data"), 
         transform=train_transform
     )
 
