@@ -1,117 +1,152 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import torchvision
-from torchvision import transforms, datasets
 import os
+import json
+import torch
+import torchvision
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from PIL import Image
 from tqdm import tqdm
-import multiprocessing
 
-if __name__ == '__main__':
-    multiprocessing.set_start_method('spawn', force=True)
-    
-    # Auto detect
+TRAIN_DIR    = "train"                      
+ANNOT_FILE   = "train/_annotations.coco.json"
+OUTPUT_MODEL = "model_final.pth"
+
+NUM_EPOCHS   = 10
+BATCH_SIZE   = 2                            # Kurangi ke 2 jika GPU VRAM < 6GB
+LEARNING_RATE = 0.005
+NUM_WORKERS  = 4 if torch.cuda.is_available() else 0
+
+class CocoDetectionDataset(Dataset):
+    def __init__(self, img_dir, annot_path):
+        with open(annot_path) as f:
+            coco = json.load(f)
+
+        # Buat mapping: image_id -> file_name
+        self.img_dir   = img_dir
+        self.id2file   = {img["id"]: img["file_name"] for img in coco["images"]}
+        self.id2size   = {img["id"]: (img["width"], img["height"]) for img in coco["images"]}
+
+        # Kumpulkan anotasi per gambar
+        self.annots = {}
+        for ann in coco["annotations"]:
+            iid = ann["image_id"]
+            if iid not in self.annots:
+                self.annots[iid] = []
+            self.annots[iid].append(ann)
+
+        # Hanya proses gambar yang punya anotasi
+        self.image_ids = [iid for iid in self.id2file if iid in self.annots]
+
+        # Mapping category_id -> label (mulai dari 1, 0 = background)
+        self.cat2label = {cat["id"]: idx + 1 for idx, cat in enumerate(coco["categories"])}
+        self.label2name = {idx + 1: cat["name"] for idx, cat in enumerate(coco["categories"])}
+
+        print(f"Dataset: {len(self.image_ids)} gambar")
+        print(f"Kelas  : {self.label2name}")
+
+        self.transform = transforms.ToTensor()
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        fname    = os.path.basename(self.id2file[image_id])
+        img_path = os.path.join(self.img_dir, fname)
+
+        image = Image.open(img_path).convert("RGB")
+        image = self.transform(image)
+
+        boxes, labels = [], []
+        for ann in self.annots[image_id]:
+            x, y, w, h = [float(v) for v in ann["bbox"]]
+            if w <= 0 or h <= 0:
+                continue
+            boxes.append([x, y, x + w, y + h])
+            labels.append(self.cat2label[ann["category_id"]])
+
+        target = {
+            "boxes":  torch.tensor(boxes,  dtype=torch.float32),
+            "labels": torch.tensor(labels, dtype=torch.int64),
+            "image_id": torch.tensor([image_id]),
+        }
+        return image, target
+
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+
+def build_model(num_classes):
+    """Load Faster R-CNN pretrained, ganti head sesuai jumlah kelas."""
+    model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    # num_classes + 1 karena index 0 = background
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes + 1)
+    return model
+
+
+def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    DATA_PATH = r"D:\code\kuliah\robot-ai\training\train"               # Folder path
-    NUM_CLASSES = 2              # Banyak Folder/class di Path
-    BATCH_SIZE = 32
-    NUM_EPOCHS = 20
-    LEARNING_RATE = 0.001
-    IMAGE_SIZE = 224             # Size gambar              
-    NUM_WORKERS = 4 if torch.cuda.is_available() else 0 # Buat GPU, 0 buat CPU
-
-    # Data transform
-    train_transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    val_transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    print(f"\nDevice: {device}")
+    if device.type == "cuda":
+        print(f"GPU   : {torch.cuda.get_device_name(0)}")
 
     # Load dataset
-    train_dataset = datasets.ImageFolder(
-        root=os.path.join(DATA_PATH, "train _data"), 
-        transform=train_transform
-    )
+    dataset = CocoDetectionDataset(TRAIN_DIR, ANNOT_FILE)
+    loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                         num_workers=NUM_WORKERS, collate_fn=collate_fn,
+                         pin_memory=(device.type == "cuda"))
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
+    num_classes = len(dataset.label2name)   # jumlah kelas tanpa background
+    model = build_model(num_classes).to(device)
 
-    print(f"Loaded {len(train_dataset)} training images")
-    print(f"Classes: {train_dataset.classes}")
+    # Optimizer hanya untuk parameter yang di-train
+    params    = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(params, lr=LEARNING_RATE, momentum=0.9, weight_decay=0.0005)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
+    print(f"\nMulai training {NUM_EPOCHS} epoch...\n")
+    best_loss = float("inf")
 
-    # Tranfer Learning buat 1000 lebih images
-    model = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, NUM_CLASSES)
-
-    model = model.to(device)
-
-    # Freeze layer awal buat faster training
-    for param in model.parameters():
-        param.requires_grad = False
-    for param in model.layer4.parameters():
-        param.requires_grad = True
-    for param in model.fc.parameters():
-        param.requires_grad = True
-    
-    
-    # Loss, Optimizer, Scheduler
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam([{'params': model.layer4.parameters(), 'lr': LEARNING_RATE*0.1},{'params': model.fc.parameters(), 'lr': LEARNING_RATE}], lr=LEARNING_RATE)   # Cuma buat optimize layer terakhir
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-
-    # Training loop
-    best_acc = 0.0
-
-    for epoch in range(NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-    
-        # Train
+    for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+        total_loss = 0.0
 
-        progress_bar = tqdm(train_loader, desc="Training")
-        for images, labels in progress_bar:
-            images, labels = images.to(device), labels.to(device)
-        
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}")
+        for images, targets in pbar:
+            images  = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            loss_dict = model(images, targets)
+            loss      = sum(loss_dict.values())
+
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-        
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
 
-            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-    
-        train_acc = 100 * train_correct / train_total
-        train_loss = train_loss / len(train_loader)
-    
+            total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_loss = total_loss / len(loader)
         scheduler.step()
-    
-        print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.2f}%")
-    
-        if (epoch + 1) % 5 == 0:
-                torch.save(model.state_dict(), f"resnet18_epoch_{epoch+1}.pth")
-                print(f"Model saved at epoch {epoch+1}")
-    
-        print("\nTraining finished!")
-        torch.save(model.state_dict(), "final_model.pth")
-        print("Final model saved as final_model.pth")
+        print(f"  Epoch {epoch} | Avg Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+
+        # Simpan model terbaik
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), OUTPUT_MODEL)
+            print(f"  -> Model tersimpan: {OUTPUT_MODEL}  (loss terbaik: {best_loss:.4f})")
+
+    print(f"\nTraining selesai! Model final: {OUTPUT_MODEL}")
+    print(f"Kelas yang dilatih: {dataset.label2name}")
+    # Simpan info kelas agar bisa dipakai di deteksi
+    with open("label_map.json", "w") as f:
+        json.dump(dataset.label2name, f, indent=2)
+    print("Info kelas tersimpan: label_map.json")
+
+
+if __name__ == "__main__":
+    train()
